@@ -41,6 +41,7 @@ def compute_long_history_features(compact: pd.DataFrame) -> pd.DataFrame:
         Games=("Win", "count"),
         Wins=("Win", "sum"),
         MarginAvg=("Margin", "mean"),
+        MarginStd=("Margin", "std"),
         CloseGameWins=("Win", "sum"),
     )
     grouped["WinPct"] = grouped["Wins"] / grouped["Games"]

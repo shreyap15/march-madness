@@ -90,11 +90,18 @@ def _recent_form(detailed: pd.DataFrame) -> pd.DataFrame:
         .mean()
         .reset_index(level=[0, 1], drop=True)
     )
+    all_games["Last5NetRtg"] = (
+        all_games.groupby(["Season", "TeamID"])["NetRtg"]
+        .rolling(5, min_periods=1)
+        .mean()
+        .reset_index(level=[0, 1], drop=True)
+    )
+    all_games["TrendNetRtg"] = all_games["Last5NetRtg"] - all_games["Last10NetRtg"]
 
     last10 = (
         all_games.sort_values(["Season", "TeamID", "GameIndex"])
         .groupby(["Season", "TeamID"], as_index=False)
-        .tail(1)[["Season", "TeamID", "Last10NetRtg"]]
+        .tail(1)[["Season", "TeamID", "Last10NetRtg", "Last5NetRtg", "TrendNetRtg"]]
     )
     return last10
 
@@ -111,8 +118,21 @@ def build_team_features(raw: dict) -> pd.DataFrame:
     eff = eff.merge(recent, on=["Season", "TeamID"], how="left")
     eff["AdjNetRtg"] = 0.7 * eff["NetRtg"] + 0.3 * eff["Last10NetRtg"]
 
+    # Tournament program performance history (regular season net vs tourney net)
+    tourney_eff = compute_efficiency_by_team(raw["tourney_detailed"])
+    tourney_eff = tourney_eff.rename(columns={"NetRtg": "TourneyNetRtg"})
+    reg_eff = eff[["Season", "TeamID", "NetRtg"]].rename(columns={"NetRtg": "RegNetRtg"})
+    perf = tourney_eff.merge(reg_eff, on=["Season", "TeamID"], how="left")
+    perf["TourneyDelta"] = perf["TourneyNetRtg"] - perf["RegNetRtg"]
+    perf = perf.sort_values(["TeamID", "Season"])
+    perf["ProgramTourneyEff"] = (
+        perf.groupby("TeamID")["TourneyDelta"].shift(1).expanding().mean().reset_index(level=0, drop=True)
+    )
+    perf = perf[["Season", "TeamID", "ProgramTourneyEff"]]
+
     team = long_features.merge(elo_by_team, on=["Season", "TeamID"], how="left")
     team = team.merge(eff, on=["Season", "TeamID"], how="left")
+    team = team.merge(perf, on=["Season", "TeamID"], how="left")
     team = team.merge(seeds, on=["Season", "TeamID"], how="left")
     team = team.merge(conf_tourney, on=["Season", "TeamID"], how="left")
     team = attach_conference_strength(team, raw["conferences"], elo_by_team)
@@ -138,6 +158,56 @@ def build_team_features(raw: dict) -> pd.DataFrame:
         .agg(OppElo=("OppElo", "mean"), OppNetRtg=("OppNetRtg", "mean"))
     )
     team = team.merge(sos, on=["Season", "TeamID"], how="left")
+
+    # ESPN ratings (additional signal from external polls)
+    try:
+        espn = pd.read_csv("data/espn_ratings/wncaa_espn.csv")
+        espn = espn.rename(columns={"Votes": "ESPNVotes"})
+        espn["ESPNRank"] = espn.groupby("Season")["ESPNVotes"].rank(ascending=False, method="min")
+        team = team.merge(espn[["Season", "TeamID", "ESPNVotes"]], on=["Season", "TeamID"], how="left")
+        team = team.merge(espn[["Season", "TeamID", "ESPNRank"]], on=["Season", "TeamID"], how="left")
+    except FileNotFoundError:
+        pass
+
+    # FiveThirtyEight ratings (additional external signal)
+    try:
+        fte = pd.read_csv("data/fivethirtyeight_ratings/538ratingsWomen.csv")
+        fte = fte.rename(columns={"538rating": "FTERating"})
+        fte["FTERank"] = fte.groupby("Season")["FTERating"].rank(ascending=False, method="min")
+        team = team.merge(fte[["Season", "TeamID", "FTERating"]], on=["Season", "TeamID"], how="left")
+        team = team.merge(fte[["Season", "TeamID", "FTERank"]], on=["Season", "TeamID"], how="left")
+    except FileNotFoundError:
+        pass
+
+    # Coaching stability proxy: rolling win% std over last 3 seasons (shifted)
+    stability = team[["Season", "TeamID", "WinPct"]].copy().sort_values(["TeamID", "Season"])
+    stability["WinPctStd3"] = (
+        stability.groupby("TeamID")["WinPct"]
+        .rolling(3, min_periods=1)
+        .std()
+        .shift(1)
+        .reset_index(level=0, drop=True)
+    )
+    team = team.merge(stability[["Season", "TeamID", "WinPctStd3"]], on=["Season", "TeamID"], how="left")
+
+    # Coach features (2026 snapshot, if available)
+    try:
+        coaches = pd.read_csv("data/WNCAAWCoaches_2026_mapped.csv")
+        coaches = coaches.rename(
+            columns={
+                "TenureYears_2026": "CoachTenureYears",
+                "IsVacant": "CoachIsVacant",
+                "IsInterim": "CoachIsInterim",
+            }
+        )
+        coaches["Season"] = 2026
+        team = team.merge(
+            coaches[["Season", "TeamID", "CoachTenureYears", "CoachIsVacant", "CoachIsInterim"]],
+            on=["Season", "TeamID"],
+            how="left",
+        )
+    except FileNotFoundError:
+        pass
 
     return team
 
@@ -182,6 +252,9 @@ def build_training_dataset(raw: dict) -> Tuple[pd.DataFrame, List[str]]:
     feature_cols = [
         "Elo",
         "AdjNetRtg",
+        "Last5NetRtg",
+        "Last10NetRtg",
+        "TrendNetRtg",
         "NetRtg",
         "eFG",
         "TS",
@@ -195,22 +268,145 @@ def build_training_dataset(raw: dict) -> Tuple[pd.DataFrame, List[str]]:
         "OppElo",
         "OppNetRtg",
         "ConfTourneyWins",
+        "ProgramTourneyEff",
         "WinPct",
         "MarginAvg",
+        "MarginStd",
         "CloseWinPct",
         "HomeWinPct",
         "AwayWinPct",
         "NeutralWinPct",
+        "ESPNRank",
+        "ESPNVotes",
+        "FTERank",
+        "FTERating",
+        "WinPctStd3",
+        "CoachTenureYears",
+        "CoachIsVacant",
+        "CoachIsInterim",
     ]
 
     tourney = raw["tourney_compact"]
+    # Historical upset rate by seed matchup (women's)
+    seed_map = raw["seeds"].copy()
+    seed_map["SeedNum"] = seed_map["Seed"].str[1:3].astype(int)
+    seed_lookup = seed_map[["Season", "TeamID", "SeedNum"]]
+    tourney_seed = tourney.merge(
+        seed_lookup.rename(columns={"TeamID": "WTeamID", "SeedNum": "WSeed"}),
+        on=["Season", "WTeamID"],
+        how="left",
+    ).merge(
+        seed_lookup.rename(columns={"TeamID": "LTeamID", "SeedNum": "LSeed"}),
+        on=["Season", "LTeamID"],
+        how="left",
+    )
+    tourney_seed["SeedHigh"] = tourney_seed[["WSeed", "LSeed"]].max(axis=1)
+    tourney_seed["SeedLow"] = tourney_seed[["WSeed", "LSeed"]].min(axis=1)
+    tourney_seed["Upset"] = (tourney_seed["WSeed"] > tourney_seed["LSeed"]).astype(int)
+    upset_rates = (
+        tourney_seed.groupby(["SeedLow", "SeedHigh"], as_index=False)["Upset"]
+        .mean()
+        .rename(columns={"Upset": "SeedMatchupUpsetRate"})
+    )
     rows: List[dict] = []
+    team_idx = team.set_index(["Season", "TeamID"])
+
+    # Head-to-head features from regular season
+    reg = raw["regular_compact"]
+    h2h = {}
+    for _, g in reg.iterrows():
+        season = int(g["Season"])
+        w = int(g["WTeamID"])
+        l = int(g["LTeamID"])
+        margin = float(g["WScore"] - g["LScore"])
+        key = (season, min(w, l), max(w, l))
+        if key not in h2h:
+            h2h[key] = {"games": 0, "wins_a": 0, "margin_a": 0.0}
+        rec = h2h[key]
+        rec["games"] += 1
+        if w == key[1]:
+            rec["wins_a"] += 1
+            rec["margin_a"] += margin
+        else:
+            rec["margin_a"] -= margin
+
     for _, game in tourney.iterrows():
-        rows.extend(_matchup_rows(game, team, feature_cols))
+        matchup_rows = _matchup_rows(game, team, feature_cols)
+        season = int(game["Season"])
+        a = int(game["WTeamID"])
+        b = int(game["LTeamID"])
+        key = (season, min(a, b), max(a, b))
+        rec = h2h.get(key, {"games": 0, "wins_a": 0, "margin_a": 0.0})
+        games = rec["games"]
+        wins_a = rec["wins_a"]
+        margin_a = rec["margin_a"] / games if games > 0 else np.nan
+        winpct_a = wins_a / games if games > 0 else np.nan
+        # For row_w (TeamA=a), if a is the smaller id we use wins_a else invert
+        is_a_small = a == key[1]
+        h2h_win = winpct_a if is_a_small else (1 - winpct_a if games > 0 else np.nan)
+        h2h_margin = margin_a if is_a_small else (-margin_a if games > 0 else np.nan)
+        for row in matchup_rows:
+            if row["TeamA"] == a:
+                row["H2HGames"] = games
+                row["H2HWinPct"] = h2h_win
+                row["H2HMargin"] = h2h_margin
+            else:
+                row["H2HGames"] = games
+                row["H2HWinPct"] = (1 - h2h_win) if games > 0 else np.nan
+                row["H2HMargin"] = -h2h_margin if games > 0 else np.nan
+
+        # Seed upset interactions (classic upset bands and seed quality vs net rating)
+        for row in matchup_rows:
+            seed_a = row.get("SeedNum_diff", np.nan)
+            # Seed difference as absolute for matchup type
+            sd = abs(seed_a) if not np.isnan(seed_a) else np.nan
+            row["ClassicUpsetSeed"] = 1 if sd in [3, 4, 5, 6, 7] else 0
+            # Historical upset rate for this seed matchup
+            seed_a_val = team_idx.loc[(season, row["TeamA"])].get("SeedNum", np.nan) if (season, row["TeamA"]) in team_idx.index else np.nan
+            seed_b_val = team_idx.loc[(season, row["TeamB"])].get("SeedNum", np.nan) if (season, row["TeamB"]) in team_idx.index else np.nan
+            if pd.notna(seed_a_val) and pd.notna(seed_b_val):
+                low = min(seed_a_val, seed_b_val)
+                high = max(seed_a_val, seed_b_val)
+                match = upset_rates[(upset_rates["SeedLow"] == low) & (upset_rates["SeedHigh"] == high)]
+                row["SeedMatchupUpsetRate"] = float(match["SeedMatchupUpsetRate"].iloc[0]) if not match.empty else np.nan
+            else:
+                row["SeedMatchupUpsetRate"] = np.nan
+            if "NetRtg_diff" in row and "SeedNum_diff" in row:
+                # TeamA net rating relative to seed expectation
+                row["NetRtgVsSeed"] = row["NetRtg_diff"] * (-row["SeedNum_diff"])
+            else:
+                row["NetRtgVsSeed"] = np.nan
+            # ESPN seed residual and interaction
+            if "ESPNRank_diff" in row and "SeedNum_diff" in row:
+                row["ESPNSeedResidualDiff"] = row["ESPNRank_diff"] - row["SeedNum_diff"]
+                row["SeedResidualInteraction"] = row["SeedNum_diff"] * row["ESPNSeedResidualDiff"]
+            else:
+                row["ESPNSeedResidualDiff"] = np.nan
+                row["SeedResidualInteraction"] = np.nan
+            # 538 seed residual and interaction
+            if "FTERank_diff" in row and "SeedNum_diff" in row:
+                row["FTESeedResidualDiff"] = row["FTERank_diff"] - row["SeedNum_diff"]
+                row["FTESeedResidualInteraction"] = row["SeedNum_diff"] * row["FTESeedResidualDiff"]
+            else:
+                row["FTESeedResidualDiff"] = np.nan
+                row["FTESeedResidualInteraction"] = np.nan
+        rows.extend(matchup_rows)
 
     dataset = pd.DataFrame(rows)
     diff_cols = [f"{c}_diff" for c in feature_cols]
-    return dataset, diff_cols
+    extra_cols = [
+        "H2HGames",
+        "H2HWinPct",
+        "H2HMargin",
+        "ClassicUpsetSeed",
+        "SeedMatchupUpsetRate",
+        "NetRtgVsSeed",
+        "ESPNSeedResidualDiff",
+        "SeedResidualInteraction",
+        "FTESeedResidualDiff",
+        "FTESeedResidualInteraction",
+    ]
+    return dataset, diff_cols + extra_cols
 
 
 def main() -> None:

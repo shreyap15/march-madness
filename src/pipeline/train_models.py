@@ -10,9 +10,9 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss
 from sklearn.pipeline import Pipeline
+from sklearn.model_selection import KFold
 
 from src.models.logistic_model import LogisticConfig, train_logistic
-from src.models.xgboost_model import train_xgboost
 from src.models.ensemble import blend_predictions
 
 
@@ -31,6 +31,20 @@ def _split_by_season(df: pd.DataFrame):
 def train_models(dataset_path: str = "data/processed/training_dataset.csv") -> None:
     df = pd.read_csv(dataset_path)
     feature_cols = [c for c in df.columns if c.endswith("_diff")]
+    for extra in [
+        "H2HGames",
+        "H2HWinPct",
+        "H2HMargin",
+        "ClassicUpsetSeed",
+        "SeedMatchupUpsetRate",
+        "NetRtgVsSeed",
+        "ESPNSeedResidualDiff",
+        "SeedResidualInteraction",
+        "FTESeedResidualDiff",
+        "FTESeedResidualInteraction",
+    ]:
+        if extra in df.columns:
+            feature_cols.append(extra)
 
     train, val, _ = _split_by_season(df)
     X_train = train[feature_cols]
@@ -57,38 +71,20 @@ def train_models(dataset_path: str = "data/processed/training_dataset.csv") -> N
     rf_pipeline = Pipeline([("imputer", rf_pipe), ("rf", rf)])
     rf_pipeline.fit(X_train, y_train)
 
-    # XGBoost
-    xgb_model = None
-    try:
-        xgb_model, _ = train_xgboost(train, feature_cols, "Target")
-    except ImportError:
-        xgb_model = None
 
     # Calibrate each model on validation set (probability-level isotonic)
     log_val = log_model.predict_proba(X_val)[:, 1]
     rf_val = rf_pipeline.predict_proba(X_val)[:, 1]
-    xgb_val = xgb_model.predict_proba(X_val)[:, 1] if xgb_model is not None else None
-    elo_val = 0.5 + 0.5 * np.tanh(X_val["Elo_diff"] / 400.0)
-
     cal_log = IsotonicRegression(out_of_bounds="clip")
     cal_log.fit(log_val, y_val)
     cal_rf = IsotonicRegression(out_of_bounds="clip")
     cal_rf.fit(rf_val, y_val)
-    cal_xgb = None
-    if xgb_val is not None:
-        cal_xgb = IsotonicRegression(out_of_bounds="clip")
-        cal_xgb.fit(xgb_val, y_val)
-    elo_cal = IsotonicRegression(out_of_bounds="clip")
-    elo_cal.fit(elo_val, y_val)
 
     # Validation predictions (calibrated)
     preds = {
         "logistic": cal_log.transform(log_val),
         "rf": cal_rf.transform(rf_val),
-        "elo": elo_cal.transform(elo_val),
     }
-    if cal_xgb is not None:
-        preds["xgb"] = cal_xgb.transform(xgb_val)
 
     def _optimize_weights(preds_dict: dict, y_true: pd.Series) -> dict:
         keys = list(preds_dict.keys())
@@ -109,13 +105,23 @@ def train_models(dataset_path: str = "data/processed/training_dataset.csv") -> N
         w = w / max(w.sum(), 1e-12)
         return {k: float(w[i]) for i, k in enumerate(keys)}
 
+    # Correlation matrix on validation predictions
+    corr = pd.DataFrame(preds).corr()
+    corr.to_csv("data/processed/model_corr.csv")
+
     weights = _optimize_weights(preds, y_val)
 
-    blended = np.asarray(blend_predictions(preds, weights=weights))
-
-    # Platt scaling on blended outputs
-    calibrator = LogisticRegression()
-    calibrator.fit(blended.reshape(-1, 1), y_val)
+    # Stacking meta-learner (trained on validation preds with CV to avoid leakage)
+    meta_features = list(preds.keys())
+    Z_val = pd.DataFrame(preds)[meta_features].values
+    meta = LogisticRegression(C=10.0, max_iter=500)
+    oof = np.zeros(len(y_val))
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    for train_idx, val_idx in kf.split(Z_val):
+        meta_fold = LogisticRegression(C=10.0, max_iter=500)
+        meta_fold.fit(Z_val[train_idx], y_val.iloc[train_idx])
+        oof[val_idx] = meta_fold.predict_proba(Z_val[val_idx])[:, 1]
+    meta.fit(Z_val, y_val)
 
     bundle = {
         "feature_cols": feature_cols,
@@ -123,13 +129,11 @@ def train_models(dataset_path: str = "data/processed/training_dataset.csv") -> N
         "rf": rf,
         "rf_imputer": rf_pipe,
         "rf_pipeline": rf_pipeline,
-        "xgb": xgb_model,
         "cal_log": cal_log,
         "cal_rf": cal_rf,
-        "cal_xgb": cal_xgb,
-        "elo_cal": elo_cal,
-        "calibrator": calibrator,
         "weights": weights,
+        "meta_features": meta_features,
+        "meta_model": meta,
     }
 
     joblib.dump(bundle, "models/saved_models.pkl")
@@ -140,20 +144,19 @@ def train_models(dataset_path: str = "data/processed/training_dataset.csv") -> N
     def _eval(split_name: str, split_df: pd.DataFrame) -> list[dict]:
         X = split_df[feature_cols]
         y = split_df["Target"]
-        elo_base = 0.5 + 0.5 * np.tanh(X["Elo_diff"] / 400.0)
         log_p = log_model.predict_proba(X)[:, 1]
         rf_p = rf_pipeline.predict_proba(X)[:, 1]
         split_preds = {
             "logistic": cal_log.transform(log_p),
             "rf": cal_rf.transform(rf_p),
-            "elo": elo_cal.transform(elo_base),
         }
-        if xgb_model is not None:
-            xgb_p = xgb_model.predict_proba(X)[:, 1]
-            split_preds["xgb"] = cal_xgb.transform(xgb_p)
         blended_local = np.asarray(blend_predictions(split_preds, weights=weights))
-        calibrated = calibrator.predict_proba(blended_local.reshape(-1, 1))[:, 1]
-        split_preds["ensemble"] = calibrated
+        Z = pd.DataFrame(split_preds)[meta_features].values
+        ensemble = meta.predict_proba(Z)[:, 1]
+        # Use out-of-fold ensemble for validation to avoid leakage
+        if split_name == "validation":
+            ensemble = oof
+        split_preds["ensemble"] = ensemble
 
         rows = []
         for name, p in split_preds.items():

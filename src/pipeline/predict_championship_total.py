@@ -40,22 +40,21 @@ def _expected_total(team_a: pd.Series, team_b: pd.Series) -> MatchupTotals:
 def _matchup_features(team_a: pd.Series, team_b: pd.Series, feature_cols: list[str]) -> pd.DataFrame:
     row = {}
     for col in feature_cols:
-        base = col.replace("_diff", "")
-        row[col] = team_a.get(base, np.nan) - team_b.get(base, np.nan)
+        if col.endswith("_diff"):
+            base = col.replace("_diff", "")
+            row[col] = team_a.get(base, np.nan) - team_b.get(base, np.nan)
+        else:
+            row[col] = np.nan
     return pd.DataFrame([row])
 
 
 def _predict_probs(bundle: dict, X: pd.DataFrame) -> np.ndarray:
     preds = {
         "logistic": bundle["logistic"].predict_proba(X)[:, 1],
-        "rf": bundle["rf"].predict_proba(bundle["rf_imputer"].transform(X))[:, 1],
-        "elo": 0.5 + 0.5 * np.tanh(X["Elo_diff"] / 400.0),
+        "rf": bundle["rf_pipeline"].predict_proba(X)[:, 1],
     }
-    if bundle.get("xgb") is not None:
-        preds["xgb"] = bundle["xgb"].predict_proba(X)[:, 1]
-    blended = np.asarray(blend_predictions(preds, weights=bundle.get("weights")))
-    calibrated = bundle["calibrator"].predict_proba(blended.reshape(-1, 1))[:, 1]
-    return calibrated
+    # Calibrate and use logistic-only to align with submission strategy
+    return bundle["cal_log"].transform(preds["logistic"])
 
 
 def _build_win_prob_lookup(
