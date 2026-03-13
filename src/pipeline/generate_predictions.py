@@ -170,15 +170,23 @@ def generate_predictions(season: int, out_path: str = "submissions/submission.cs
     submission = pd.DataFrame({"ID": ids, "Pred": calibrated})
     submission.to_csv(out_path, index=False)
 
-    # Also write the full pair list with predictions
+    # Write pair list without predictions (IDs only)
     pairs_out = pd.DataFrame(
         {
             "WTeamID": matchup["TeamA"].astype(int),
             "LTeamID": matchup["TeamB"].astype(int),
-            "Pred": calibrated,
         }
     )
     pairs_out.to_csv("submissions/WNCAATourneyPredictions.csv", index=False)
+
+    # Write predictions separately
+    preds_out = pd.DataFrame(
+        {
+            "ID": ids,
+            "Pred": calibrated,
+        }
+    )
+    preds_out.to_csv("submissions/WNCAATourneyPredictions_with_preds.csv", index=False)
 
 
 if __name__ == "__main__":
