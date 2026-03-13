@@ -32,6 +32,7 @@ RAW_FILES = {
     "secondary_compact": "WSecondaryTourneyCompactResults.csv",
     "conference_tourney": "WConferenceTourneyGames.csv",
     "game_cities": "WGameCities.csv",
+    "team_spellings": "WTeamSpellings.csv",
 }
 
 
