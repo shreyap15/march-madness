@@ -3,10 +3,13 @@ from __future__ import annotations
 import joblib
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.impute import SimpleImputer
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss
+from sklearn.pipeline import Pipeline
 
 from src.models.logistic_model import LogisticConfig, train_logistic
 from src.models.xgboost_model import train_xgboost
@@ -51,7 +54,8 @@ def train_models(dataset_path: str = "data/processed/training_dataset.csv") -> N
         n_jobs=1,
     )
     rf_pipe = SimpleImputer(strategy="median")
-    rf.fit(rf_pipe.fit_transform(X_train), y_train)
+    rf_pipeline = Pipeline([("imputer", rf_pipe), ("rf", rf)])
+    rf_pipeline.fit(X_train, y_train)
 
     # XGBoost
     xgb_model = None
@@ -60,16 +64,52 @@ def train_models(dataset_path: str = "data/processed/training_dataset.csv") -> N
     except ImportError:
         xgb_model = None
 
-    # Validation predictions
+    # Calibrate each model on validation set (probability-level isotonic)
+    log_val = log_model.predict_proba(X_val)[:, 1]
+    rf_val = rf_pipeline.predict_proba(X_val)[:, 1]
+    xgb_val = xgb_model.predict_proba(X_val)[:, 1] if xgb_model is not None else None
+    elo_val = 0.5 + 0.5 * np.tanh(X_val["Elo_diff"] / 400.0)
+
+    cal_log = IsotonicRegression(out_of_bounds="clip")
+    cal_log.fit(log_val, y_val)
+    cal_rf = IsotonicRegression(out_of_bounds="clip")
+    cal_rf.fit(rf_val, y_val)
+    cal_xgb = None
+    if xgb_val is not None:
+        cal_xgb = IsotonicRegression(out_of_bounds="clip")
+        cal_xgb.fit(xgb_val, y_val)
+    elo_cal = IsotonicRegression(out_of_bounds="clip")
+    elo_cal.fit(elo_val, y_val)
+
+    # Validation predictions (calibrated)
     preds = {
-        "logistic": log_model.predict_proba(X_val)[:, 1],
-        "rf": rf.predict_proba(rf_pipe.transform(X_val))[:, 1],
-        "elo": 0.5 + 0.5 * np.tanh(X_val["Elo_diff"] / 400.0),
+        "logistic": cal_log.transform(log_val),
+        "rf": cal_rf.transform(rf_val),
+        "elo": elo_cal.transform(elo_val),
     }
-    weights = {"logistic": 0.45, "rf": 0.30, "elo": 0.25}
-    if xgb_model is not None:
-        preds["xgb"] = xgb_model.predict_proba(X_val)[:, 1]
-        weights = {"xgb": 0.50, "logistic": 0.25, "rf": 0.15, "elo": 0.10}
+    if cal_xgb is not None:
+        preds["xgb"] = cal_xgb.transform(xgb_val)
+
+    def _optimize_weights(preds_dict: dict, y_true: pd.Series) -> dict:
+        keys = list(preds_dict.keys())
+        P = np.vstack([preds_dict[k] for k in keys]).T
+
+        def loss(w: np.ndarray) -> float:
+            w = np.clip(w, 0.0, 1.0)
+            w = w / max(w.sum(), 1e-12)
+            p = np.clip(P @ w, 1e-6, 1 - 1e-6)
+            return log_loss(y_true, p)
+
+        init = np.ones(len(keys)) / len(keys)
+        cons = {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
+        bounds = [(0.0, 1.0)] * len(keys)
+        result = minimize(loss, init, bounds=bounds, constraints=cons, method="SLSQP")
+        w = result.x if result.success else init
+        w = np.clip(w, 0.0, 1.0)
+        w = w / max(w.sum(), 1e-12)
+        return {k: float(w[i]) for i, k in enumerate(keys)}
+
+    weights = _optimize_weights(preds, y_val)
 
     blended = np.asarray(blend_predictions(preds, weights=weights))
 
@@ -82,7 +122,12 @@ def train_models(dataset_path: str = "data/processed/training_dataset.csv") -> N
         "logistic": log_model,
         "rf": rf,
         "rf_imputer": rf_pipe,
+        "rf_pipeline": rf_pipeline,
         "xgb": xgb_model,
+        "cal_log": cal_log,
+        "cal_rf": cal_rf,
+        "cal_xgb": cal_xgb,
+        "elo_cal": elo_cal,
         "calibrator": calibrator,
         "weights": weights,
     }
@@ -95,13 +140,17 @@ def train_models(dataset_path: str = "data/processed/training_dataset.csv") -> N
     def _eval(split_name: str, split_df: pd.DataFrame) -> list[dict]:
         X = split_df[feature_cols]
         y = split_df["Target"]
+        elo_base = 0.5 + 0.5 * np.tanh(X["Elo_diff"] / 400.0)
+        log_p = log_model.predict_proba(X)[:, 1]
+        rf_p = rf_pipeline.predict_proba(X)[:, 1]
         split_preds = {
-            "logistic": log_model.predict_proba(X)[:, 1],
-            "rf": rf.predict_proba(rf_pipe.transform(X))[:, 1],
-            "elo": 0.5 + 0.5 * np.tanh(X["Elo_diff"] / 400.0),
+            "logistic": cal_log.transform(log_p),
+            "rf": cal_rf.transform(rf_p),
+            "elo": elo_cal.transform(elo_base),
         }
         if xgb_model is not None:
-            split_preds["xgb"] = xgb_model.predict_proba(X)[:, 1]
+            xgb_p = xgb_model.predict_proba(X)[:, 1]
+            split_preds["xgb"] = cal_xgb.transform(xgb_p)
         blended_local = np.asarray(blend_predictions(split_preds, weights=weights))
         calibrated = calibrator.predict_proba(blended_local.reshape(-1, 1))[:, 1]
         split_preds["ensemble"] = calibrated

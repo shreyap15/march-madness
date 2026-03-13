@@ -54,13 +54,17 @@ def generate_predictions(season: int, out_path: str = "submissions/submission.cs
     matchup = _build_matchups(team_features, season, [c.replace("_diff", "") for c in feature_cols])
     X = matchup[feature_cols]
 
+    elo_base = 0.5 + 0.5 * np.tanh(X["Elo_diff"] / 400.0)
+    log_p = bundle["logistic"].predict_proba(X)[:, 1]
+    rf_p = bundle["rf_pipeline"].predict_proba(X)[:, 1]
     preds = {
-        "logistic": bundle["logistic"].predict_proba(X)[:, 1],
-        "rf": bundle["rf"].predict_proba(bundle["rf_imputer"].transform(X))[:, 1],
-        "elo": 0.5 + 0.5 * np.tanh(X["Elo_diff"] / 400.0),
+        "logistic": bundle["cal_log"].transform(log_p),
+        "rf": bundle["cal_rf"].transform(rf_p),
+        "elo": bundle["elo_cal"].transform(elo_base),
     }
     if bundle.get("xgb") is not None:
-        preds["xgb"] = bundle["xgb"].predict_proba(X)[:, 1]
+        xgb_p = bundle["xgb"].predict_proba(X)[:, 1]
+        preds["xgb"] = bundle["cal_xgb"].transform(xgb_p)
 
     blended = np.asarray(blend_predictions(preds, weights=bundle.get("weights")))
     calibrated = bundle["calibrator"].predict_proba(blended.reshape(-1, 1))[:, 1]
