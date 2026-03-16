@@ -69,8 +69,8 @@
 - R4Z1: South Carolina vs TCU -> **South Carolina** (p=0.7895)
 
 ## Final Four
-- R5WX: Connecticut vs LSU -> **Connecticut** (p=0.5114)
-- R5YZ: Texas vs South Carolina -> **South Carolina** (p=0.5305)
+- R5WX: Connecticut vs South Carolina -> **South Carolina** (p=0.6250)
+- R5YZ: LSU vs Texas -> **Texas** (p=0.6250)
 
 ## Championship
-- R6CH: Connecticut vs South Carolina -> **South Carolina** (p=0.6250)
+- R6CH: South Carolina vs Texas -> **South Carolina** (p=0.5305)
