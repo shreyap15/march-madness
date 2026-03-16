@@ -54,7 +54,49 @@ def _predict_probs(bundle: dict, X: pd.DataFrame) -> np.ndarray:
         "rf": bundle["rf_pipeline"].predict_proba(X)[:, 1],
     }
     # Calibrate and use logistic-only to align with submission strategy
+    if bundle.get("cal_log_type") == "platt":
+        return bundle["cal_log"].predict_proba(preds["logistic"].reshape(-1, 1))[:, 1]
     return bundle["cal_log"].transform(preds["logistic"])
+
+
+def _predict_total_from_bracket(
+    season: int,
+    team_features: pd.DataFrame,
+    bracket_path: str,
+) -> pd.DataFrame | None:
+    if season != 2026:
+        return None
+    try:
+        bracket = pd.read_csv(bracket_path)
+    except FileNotFoundError:
+        return None
+    final_row = bracket[bracket["Slot"] == "R6CH"]
+    if final_row.empty:
+        return None
+    final_row = final_row.iloc[0]
+    # Use actual finalists from the bracket results row
+    team_a = final_row.get("StrongTeamID")
+    team_b = final_row.get("WeakTeamID")
+    if pd.isna(team_a) or pd.isna(team_b):
+        return None
+
+    team_features = team_features.set_index("TeamID")
+    ta = team_features.loc[int(team_a)]
+    tb = team_features.loc[int(team_b)]
+    totals = _expected_total(ta, tb)
+    out = pd.DataFrame(
+        [
+            {
+                "Season": season,
+                "FinalSlot": "R6CH",
+                "ExpectedCombinedScore": round(totals.expected_total, 2),
+                "MostLikelyTeamA": int(team_a),
+                "MostLikelyTeamB": int(team_b),
+                "MostLikelyPairTotal": round(totals.expected_total, 2),
+            }
+        ]
+    )
+    return out
 
 
 def _build_win_prob_lookup(
@@ -128,9 +170,11 @@ def predict_championship_total(
     seeds = raw["seeds"]
 
     if season not in slots["Season"].unique():
-        season = int(slots["Season"].max())
+        if season != 2026:
+            season = int(slots["Season"].max())
     if season not in seeds["Season"].unique():
-        season = int(seeds["Season"].max())
+        if season != 2026:
+            season = int(seeds["Season"].max())
 
     slots = slots[slots["Season"] == season].copy()
     seeds = seeds[seeds["Season"] == season].copy()
@@ -142,6 +186,16 @@ def predict_championship_total(
     team_features["Elo"] = team_features["Elo"].fillna(1500.0)
 
     bundle = joblib.load("models/saved_models.pkl")
+
+    # If we have a bracket result for 2026, align the total to that final matchup
+    aligned = _predict_total_from_bracket(
+        season,
+        team_features,
+        bracket_path="submissions/bracket_2026_results.csv",
+    )
+    if aligned is not None:
+        aligned.to_csv(out_path, index=False)
+        return
 
     team_ids = sorted(seeds["TeamID"].unique().tolist())
     win_prob = _build_win_prob_lookup(bundle, team_features, team_ids)

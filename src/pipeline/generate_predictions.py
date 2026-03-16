@@ -205,7 +205,24 @@ def generate_predictions(
 
     # Use calibrated logistic regression as primary submission model
     calibrated = preds["logistic"]
-    submission_pred = np.clip(calibrated, 0.05, 0.95)
+    submission_pred = calibrated.copy()
+
+    # Deterministic tiebreak for near-coinflips
+    if "Elo_diff" in matchup.columns and "AdjNetRtg_diff" in matchup.columns:
+        elo_diff = matchup["Elo_diff"].fillna(0.0).values
+        adj_diff = matchup["AdjNetRtg_diff"].fillna(0.0).values
+        mask = (submission_pred >= 0.49) & (submission_pred <= 0.51)
+        if mask.any():
+            submission_pred = submission_pred + mask * ((elo_diff / 400.0) * 0.15 + adj_diff * 0.05)
+            submission_pred = np.clip(submission_pred, 0.0, 1.0)
+    # Final deterministic nudge for exact ties
+    tie_mask = (submission_pred >= 0.499) & (submission_pred <= 0.501)
+    if tie_mask.any():
+        a_ids = matchup["TeamA"].astype(int).values
+        b_ids = matchup["TeamB"].astype(int).values
+        nudge = np.where(a_ids < b_ids, 0.001, -0.001)
+        submission_pred = submission_pred + tie_mask * nudge
+        submission_pred = np.clip(submission_pred, 0.0, 1.0)
 
     ids = matchup.apply(lambda r: f"{season}_{int(r['TeamA'])}_{int(r['TeamB'])}", axis=1)
     submission = pd.DataFrame({"ID": ids, "Pred": submission_pred})
@@ -213,12 +230,12 @@ def generate_predictions(
 
     # Write winner/loser list (based on 0.5 threshold) as primary pairs file
     winners = np.where(
-        calibrated >= 0.5,
+        submission_pred >= 0.5,
         matchup["TeamA"].astype(int).values,
         matchup["TeamB"].astype(int).values,
     )
     losers = np.where(
-        calibrated >= 0.5,
+        submission_pred >= 0.5,
         matchup["TeamB"].astype(int).values,
         matchup["TeamA"].astype(int).values,
     )
@@ -229,7 +246,7 @@ def generate_predictions(
     preds_out = pd.DataFrame(
         {
             "ID": ids,
-            "Pred": calibrated,
+            "Pred": submission_pred,
         }
     )
     preds_out.to_csv("submissions/WNCAATourneyPredictions_with_preds.csv", index=False)
