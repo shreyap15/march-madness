@@ -49,8 +49,12 @@ def generate_predictions(
 ) -> None:
     raw = load_raw()
     team_features = build_team_features(raw)
-    all_teams = raw["teams"][["TeamID"]].drop_duplicates()
-    base = all_teams.assign(Season=season)
+    teams = raw["teams"]
+    if "LastD1Season" in teams.columns:
+        active = teams[teams["LastD1Season"] == season][["TeamID"]].drop_duplicates()
+    else:
+        active = teams[["TeamID"]].drop_duplicates()
+    base = active.assign(Season=season)
     team_features = (
         base.merge(
             team_features[team_features["Season"] == season],

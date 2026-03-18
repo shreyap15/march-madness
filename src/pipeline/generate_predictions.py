@@ -125,8 +125,10 @@ def generate_predictions(
 ) -> None:
     raw = load_raw()
     team_features = build_team_features(raw)
-    all_teams = raw["teams"][["TeamID"]].drop_duplicates()
-    base = all_teams.assign(Season=season)
+    # Use active Division I teams for the target season
+    active = raw["conferences"]
+    active = active[active["Season"] == season][["TeamID"]].drop_duplicates()
+    base = active.assign(Season=season)
     team_features = (
         base.merge(
             team_features[team_features["Season"] == season],
